@@ -819,7 +819,8 @@ class MongoTrials(Trials):
                 query,
                 {'$inc' : {'last_id': N}},
                 upsert=True,
-                safe=True)
+                safe=True,
+                new=True)
         lid = doc.get('last_id', 0)
         return range(lid, lid + N)
 
