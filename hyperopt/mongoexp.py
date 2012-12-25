@@ -882,6 +882,7 @@ class MongoTrials(Trials):
 
             def __getitem__(_self, name):
                 try:
+                    print(name, query)
                     rval = gfs.get_version(filename=name, **query).read()
                     return rval
                 except gridfs.NoFile, e:
