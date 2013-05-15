@@ -814,15 +814,26 @@ class MongoTrials(Trials):
 
         # -- mongo docs say you can't upsert an empty document
         query = {'a': 0}
-
-        doc = db.job_ids.find_and_modify(
+        tids = db.jobs.distinct('tid')
+        if len(tids) > 0:
+            last = max(len(tids), max(tids))
+        else:
+            last = 0
+        lasts = db.job_ids.distinct('last_id')
+        if len(lasts) > 0:
+            maxn = max(lasts) 
+        else:
+            maxn = -1
+        last = max(maxn+1, last)
+        new_last = last + N
+        doc = db.job_ids.update(
                 query,
-                {'$inc' : {'last_id': N}},
+                {'$set' : {'last_id': new_last}},
                 upsert=True,
                 safe=True,
                 new=True)
         lid = doc.get('last_id', 0)
-        return range(lid, lid + N)
+        return range(last, last + N)
 
     def trial_attachments(self, trial):
         """
@@ -959,8 +970,8 @@ class MongoWorker(object):
         if self.workdir is None:
             workdir = job['misc'].get('workdir', os.getcwd())
             if workdir is None:
-                workdir = ''
-            workdir = os.path.join(workdir, str(job['_id']))
+                workdir = str(job['_id'])
+            #workdir = os.path.join(workdir, str(job['_id']))
         else:
             workdir = self.workdir
         workdir = os.path.expanduser(workdir)
@@ -1203,7 +1214,7 @@ def main_worker():
     parser.add_option("--reserve-timeout",
             dest='reserve_timeout',
             metavar='T',
-            default=120.0,
+            default=10000.0,
             help="poll database for up to T seconds to reserve a job")
     parser.add_option("--workdir",
             dest="workdir",

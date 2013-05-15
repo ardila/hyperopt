@@ -398,7 +398,7 @@ class Trials(object):
         return self._insert_trial_docs(docs)
 
     def new_trial_ids(self, N):
-        aa = len(self._ids)
+        aa = max(len(self._ids), max(self._ids)+1)
         rval = range(aa, aa + N)
         self._ids.update(rval)
         return rval
