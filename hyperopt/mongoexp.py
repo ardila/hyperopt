@@ -133,6 +133,11 @@ finalize the job in the database.
 __authors__ = ["James Bergstra", "Dan Yamins"]
 __license__ = "3-clause BSD License"
 __contact__ = "github.com/jaberg/hyperopt"
+DEFAULT_FIELDS = ['refresh_time', 'book_time', 'misc', 'state', 
+    '_attachments', 'tid', 'exp_key', 'version', 'owner', 'spec',
+    'result.status', 'result.loss', 'result.loss_variance', 
+    'result.true_loss', 'result.true_loss_variance', 'result.failure',
+    'result.spec']
 
 import copy
 import cPickle
@@ -179,12 +184,6 @@ class OperationFailure(Exception):
 
 
 class Shutdown(Exception):
-    """
-    Exception for telling mongo_worker loop to quit
-    """
-
-
-class WaitQuit(Exception):
     """
     Exception for telling mongo_worker loop to quit
     """
@@ -364,7 +363,7 @@ class MongoJobs(object):
         return cls(db, coll, gfs, connection, tunnel, config_name)
 
     def __iter__(self):
-        return self.jobs.find()
+        return self.jobs.find(fields=DEFAULT_FIELDS)
 
     def __len__(self):
         try:
@@ -386,17 +385,17 @@ class MongoJobs(object):
         self.create_drivers_indexes()
 
     def jobs_complete(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE))
+        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE), fields=DEFAULT_FIELDS)
         return c if cursor else list(c)
 
     def jobs_error(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR))
+        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR), fields=DEFAULT_FIELDS)
         return c if cursor else list(c)
 
     def jobs_running(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING)))
+        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), fields=DEFAULT_FIELDS))
         #TODO: mark some as MIA
         rval = [r for r in rval if not r.get('MIA', False)]
         return rval
@@ -404,13 +403,13 @@ class MongoJobs(object):
     def jobs_dead(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING)))
+        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING), fields=DEFAULT_FIELDS))
         #TODO: mark some as MIA
         rval = [r for r in rval if r.get('MIA', False)]
         return rval
 
     def jobs_queued(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW))
+        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW), fields=DEFAULT_FIELDS)
         return c if cursor else list(c)
 
     def insert(self, job, safe=True):
@@ -436,13 +435,9 @@ class MongoJobs(object):
         """Delete all jobs and attachments"""
         try:
             for d in self.jobs.find(spec=cond, fields=['_id', '_attachments']):
-                logger.info('deleting job %s' % d['_id'])
                 for name, file_id in d.get('_attachments', []):
-                    try:
-                        self.gfs.delete(file_id)
-                    except gridfs.errors.NoFile:
-                        logger.error('failed to remove attachment %s:%s' % (
-                            name, file_id))
+                    self.gfs.delete(file_id)
+                logger.info('deleting job %s' % d['_id'])
                 self.jobs.remove(d, safe=safe)
         except pymongo.errors.OperationFailure, e:
             raise OperationFailure(e)
@@ -558,7 +553,7 @@ class MongoJobs(object):
 
     def attachment_names(self, doc):
         def as_str(name_id):
-            assert isinstance(name_id[0], basestring), name
+            assert isinstance(name_id[0], basestring), name_id
             return str(name_id[0])
         return map(as_str, doc.get('_attachments', []))
 
@@ -733,7 +728,7 @@ class MongoTrials(Trials):
                 num_new = len(update_ids)
                 update_query = copy.deepcopy(query)
                 update_query['_id'] = {'$in': update_ids}
-                updated_trials = list(self.handle.jobs.find(update_query))
+                updated_trials = list(self.handle.jobs.find(update_query, fields=DEFAULT_FIELDS))
                 _trials.extend(updated_trials)
             else:
                 num_new = 0
@@ -741,7 +736,7 @@ class MongoTrials(Trials):
         else:
             #this case is for performance, though should be able to be removed
             #without breaking correctness. 
-            _trials = list(self.handle.jobs.find(query))
+            _trials = list(self.handle.jobs.find(query, fields=DEFAULT_FIELDS))
             if _trials:
                 _trials = [_trials[_i] for _i in get_most_recent_inds(_trials)]
             num_new = len(_trials)
@@ -780,23 +775,16 @@ class MongoTrials(Trials):
         rval = self.handle.jobs.find(query).count()
         return rval
 
-    def delete_all(self, cond=None):
-        if cond is None:
-            cond = {}
-        else:
-            cond = dict(cond)
-
+    def delete_all(self):
         if self._exp_key:
-            cond['exp_key'] = self._exp_key
+            cond = cond={'exp_key': self._exp_key}
+        else:
+            cond = {}
         # -- remove all documents matching condition
         self.handle.delete_all(cond)
         gfs = self.handle.gfs
         for filename in gfs.list():
-            try:
-                fdoc = gfs.get_last_version(filename=filename, **cond)
-            except gridfs.errors.NoFile:
-                continue
-            gfs.delete(fdoc._id)
+            gfs.delete(gfs.get_last_version(filename)._id)
         self.refresh()
 
     def new_trial_ids(self, N):
@@ -814,26 +802,14 @@ class MongoTrials(Trials):
 
         # -- mongo docs say you can't upsert an empty document
         query = {'a': 0}
-        tids = db.jobs.distinct('tid')
-        if len(tids) > 0:
-            last = max(len(tids), max(tids))
-        else:
-            last = 0
-        lasts = db.job_ids.distinct('last_id')
-        if len(lasts) > 0:
-            maxn = max(lasts) 
-        else:
-            maxn = -1
-        last = max(maxn+1, last)
-        new_last = last + N
-        doc = db.job_ids.update(
+
+        doc = db.job_ids.find_and_modify(
                 query,
-                {'$set' : {'last_id': new_last}},
+                {'$inc' : {'last_id': N}},
                 upsert=True,
-                safe=True,
-                new=True)
+                safe=True)
         lid = doc.get('last_id', 0)
-        return range(last, last + N)
+        return range(lid, lid + N)
 
     def trial_attachments(self, trial):
         """
@@ -882,31 +858,25 @@ class MongoTrials(Trials):
         Support syntax for store: self.attachments[name] = value
         """
         gfs = self.handle.gfs
-
-        query = {}
-        if self._exp_key:
-            query['exp_key'] = self._exp_key
-
         class Attachments(object):
             def __contains__(_self, name):
-                return gfs.exists(filename=name, **query)
+                return gfs.exists(filename=name)
 
             def __getitem__(_self, name):
                 try:
-                    print(name, query)
-                    rval = gfs.get_version(filename=name, **query).read()
+                    rval = gfs.get_version(name).read()
                     return rval
                 except gridfs.NoFile, e:
                     raise KeyError(name)
 
             def __setitem__(_self, name, value):
-                if gfs.exists(filename=name, **query):
-                    gout = gfs.get_last_version(filename=name, **query)
+                if gfs.exists(filename=name):
+                    gout = gfs.get_last_version(name)
                     gfs.delete(gout._id)
-                gfs.put(value, filename=name, **query)
+                gfs.put(value, filename=name)
 
             def __delitem__(_self, name):
-                gout = gfs.get_last_version(filename=name, **query)
+                gout = gfs.get_last_version(name)
                 gfs.delete(gout._id)
 
         return Attachments()
@@ -919,9 +889,7 @@ class MongoWorker(object):
     def __init__(self, mj,
             poll_interval=poll_interval,
             workdir=workdir,
-            exp_key=None,
-            logfilename='logfile.txt',
-            ):
+            exp_key=None):
         """
         mj - MongoJobs interface to jobs collection
         poll_interval - seconds
@@ -932,13 +900,6 @@ class MongoWorker(object):
         self.poll_interval = poll_interval
         self.workdir = workdir
         self.exp_key = exp_key
-
-        self.logfilename = logfilename
-        self.log_handler = logging.FileHandler(self.logfilename)
-        self.log_handler.setFormatter(
-            logging.Formatter(
-                fmt='%(levelname)s (%(name)s): %(message)s'))
-        self.log_handler.setLevel(logging.INFO)
 
     def run_one(self, host_id=None, reserve_timeout=None):
         if host_id == None:
@@ -970,8 +931,8 @@ class MongoWorker(object):
         if self.workdir is None:
             workdir = job['misc'].get('workdir', os.getcwd())
             if workdir is None:
-                workdir = str(job['_id'])
-            #workdir = os.path.join(workdir, str(job['_id']))
+                workdir = ''
+            workdir = os.path.join(workdir, str(job['_id']))
         else:
             workdir = self.workdir
         workdir = os.path.expanduser(workdir)
@@ -1002,10 +963,6 @@ class MongoWorker(object):
                     worker_fn = json_call(bandit_name,
                             args=bandit_args,
                             kwargs=bandit_kwargs).evaluate
-                elif cmd_protocol == 'domain_attachment':
-                    blob = ctrl.trials.attachments[cmd[1]]
-                    domain = cPickle.loads(blob)
-                    worker_fn = domain.evaluate
                 else:
                     raise ValueError('Unrecognized cmd protocol', cmd_protocol)
 
@@ -1106,15 +1063,9 @@ def main_worker_helper(options, args):
     def sighandler_shutdown(signum, frame):
         logger.info('Caught signal %i, shutting down.' % signum)
         raise Shutdown(signum)
-
-    def sighandler_wait_quit(signum, frame):
-        logger.info('Caught signal %i, shutting down.' % signum)
-        raise WaitQuit(signum)
-
     signal.signal(signal.SIGINT, sighandler_shutdown)
     signal.signal(signal.SIGHUP, sighandler_shutdown)
     signal.signal(signal.SIGTERM, sighandler_shutdown)
-    signal.signal(signal.SIGUSR1, sighandler_wait_quit)
 
     if N > 1:
         proc = None
@@ -1138,21 +1089,11 @@ def main_worker_helper(options, args):
                 proc = subprocess.Popen(sub_argv)
                 retcode = proc.wait()
                 proc = None
-
-            except Shutdown:
+            except Shutdown, e:
                 #this is the normal way to stop the infinite loop (if originally N=-1)
                 if proc:
                     #proc.terminate() is only available as of 2.6
                     os.kill(proc.pid, signal.SIGTERM)
-                    return proc.wait()
-                else:
-                    return 0
-
-            except WaitQuit:
-                # -- sending SIGUSR1 to a looping process will cause it to
-                # break out of the loop after the current subprocess finishes
-                # normally.
-                if proc:
                     return proc.wait()
                 else:
                     return 0
@@ -1174,14 +1115,10 @@ def main_worker_helper(options, args):
                 float(options.poll_interval),
                 workdir=options.workdir,
                 exp_key=options.exp_key)
-        try:
-            root_logger = logging.getLogger()
-            root_logger.addHandler(mworker.log_handler)
-            mworker.run_one(reserve_timeout=float(options.reserve_timeout))
-        finally:
-            root_logger.removeHandler(mworker.log_handler)
+        mworker.run_one(reserve_timeout=float(options.reserve_timeout))
     else:
-        raise ValueError("N <= 0")
+        parser.print_help()
+        return -1
 
 
 def main_worker():
@@ -1214,7 +1151,7 @@ def main_worker():
     parser.add_option("--reserve-timeout",
             dest='reserve_timeout',
             metavar='T',
-            default=10000.0,
+            default=120.0,
             help="poll database for up to T seconds to reserve a job")
     parser.add_option("--workdir",
             dest="workdir",
@@ -1246,6 +1183,7 @@ def bandit_from_options(options):
     return (bandit,
             (bandit_name, bandit_argv, bandit_kwargs),
             bandit_argfile_text)
+
 
 
 def algo_from_options(options, bandit):
@@ -1461,7 +1399,7 @@ def main_show_helper(options, args):
         cPickle.dump(trials_from_docs(trials.trials),
                 open(args[1], 'w'))
     elif 'vars' == cmd:
-        return plotting.main_plot_vars(trials, bandit=bandit)
+        return plotting.main_plot_vars(trials)
     else:
         logger.error("Invalid cmd %s" % cmd)
         parser.print_help()
